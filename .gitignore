@@ -3,3 +3,8 @@ node_modules
 npm-debug.log*
 .env
 
+out_cf.mp4
+out_local.mp4
+out_ngrok.mp4
+tmp/
+node_modules/
