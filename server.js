@@ -1,4 +1,4 @@
-// server.js
+// server.js - Studio Zero Production Edition
 const express = require("express");
 const cors = require("cors");
 const { chromium } = require("playwright");
@@ -24,8 +24,10 @@ async function downloadToFile(url, destPath) {
     url,
     method: "GET",
     responseType: "stream",
-    // לפעמים אתרי קבצים דורשים UA "אמיתי"
-    headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari" }
+    headers: { 
+        // מתחזה לדפדפן רגיל כדי שגוגל דרייב לא יחסום
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" 
+    }
   });
 
   return new Promise((resolve, reject) => {
@@ -56,17 +58,19 @@ async function getAudioDurationSeconds(audioPath) {
       "-of", "default=noprint_wrappers=1:nokey=1",
       audioPath,
     ]);
-    if (stderr) console.log("ffprobe stderr:", stderr);
     const sec = Math.max(1, Number((stdout || "").trim() || "0"));
     console.log("Audio duration (seconds):", sec);
     return sec;
   } catch (err) {
     console.error("ffprobe error:", err);
-    throw new Error("ffprobe failed: " + (err.stderr || err.message || String(err)));
+    throw new Error("ffprobe failed: " + (err.stderr || err.message));
   }
 }
 
 app.post("/render", async (req, res) => {
+  // הגדלת זמן ה-Timeout של השרת עצמו כדי שלא ינתק את הקשר בוידאו ארוך
+  req.setTimeout(300000); // 5 דקות
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "render-"));
   const screenshotPath = path.join(tmpDir, "screenshot.png");
   const audioPath = path.join(tmpDir, "audio.mp3");
@@ -80,50 +84,61 @@ app.post("/render", async (req, res) => {
     console.log("Incoming /render", { website_url, audio_url });
 
     if (!website_url || !audio_url) {
-      console.warn("Missing website_url or audio_url");
       return res.status(400).json({ error: "website_url and audio_url are required" });
     }
 
     // 1) Download audio
     await downloadToFile(audio_url, audioPath);
 
-    // 2) Capture screenshot using Playwright (with resilient navigation)
-    // Normalize URL (add https if missing)
-    const normalizedUrl = /^https?:\/\//i.test(website_url)
-      ? website_url
-      : `https://${website_url}`;
+    // 2) Capture screenshot - Studio Quality
+    const normalizedUrl = /^https?:\/\//i.test(website_url) ? website_url : `https://${website_url}`;
 
     console.log("Launching Playwright Chromium...");
     const browser = await chromium.launch();
     const context = await browser.newContext({
       ignoreHTTPSErrors: true,
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
-      viewport: { width: 1920, height: 1080 },
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      viewport: { width: 1920, height: 1080 }, // Full HD
+      deviceScaleFactor: 2 // RETINA QUALITY: This makes the text sharp!
     });
     const page = await context.newPage();
 
-    // Increase navigation timeout, use lighter waitUntil
-    page.setDefaultNavigationTimeout(120000); // 120s
+    page.setDefaultNavigationTimeout(60000); // 60s
     try {
-      console.log("Going to website (domcontentloaded):", normalizedUrl);
-      await page.goto(normalizedUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
+      console.log("Going to website:", normalizedUrl);
+      // מחכים עד שהרשת נרגעת (networkidle) כדי לוודא שכל התמונות נטענו
+      await page.goto(normalizedUrl, { waitUntil: "networkidle", timeout: 45000 });
     } catch (e) {
-      console.warn("goto timeout on domcontentloaded, retry with commit:", e.message);
-      // Fallback: quicker commit (no heavy network idle wait)
-      await page.goto(normalizedUrl, { waitUntil: "commit", timeout: 30000 }).catch(() => {});
+      console.warn("goto timeout, capturing what we have...");
     }
-    // let the page settle a little
-    await page.waitForTimeout(1500);
+    
+    // Smooth scrolling simulation for better rendering (optional, but good for lazy loading images)
+    await page.evaluate(async () => {
+        await new Promise((resolve) => {
+            let totalHeight = 0;
+            const distance = 100;
+            const timer = setInterval(() => {
+                const scrollHeight = document.body.scrollHeight;
+                window.scrollBy(0, distance);
+                totalHeight += distance;
+                if(totalHeight >= 1000){ // Scroll just a bit to trigger animations
+                    clearInterval(timer);
+                    window.scrollTo(0, 0); // Go back top
+                    resolve();
+                }
+            }, 50);
+        });
+    });
+    await page.waitForTimeout(1000); // Settle
 
     await page.screenshot({ path: screenshotPath, fullPage: false });
     await browser.close();
-    console.log("Screenshot saved to", screenshotPath);
+    console.log("Screenshot saved.");
 
     // 3) Get audio duration
     const durationSec = await getAudioDurationSeconds(audioPath);
 
-    // 4) Build video with ffmpeg
+    // 4) Build video with ffmpeg - High Quality Settings
     const ffmpegArgs = [
       "-loop", "1",
       "-y",
@@ -131,57 +146,40 @@ app.post("/render", async (req, res) => {
       "-i", audioPath,
       "-c:v", "libx264",
       "-t", String(durationSec),
-      "-pix_fmt", "yuv420p",
+      "-pix_fmt", "yuv420p", // Critical for compatibility with QuickTime/Mac
+      "-preset", "medium",   // Balance between speed and quality
       "-c:a", "aac",
+      "-b:a", "192k",        // High quality audio
       "-shortest",
       "-movflags", "+faststart",
       "-r", "30",
       outPath,
     ];
 
-    console.log("Running ffmpeg with args:", ffmpegArgs.join(" "));
-    try {
-      const { stdout, stderr } = await execFileAsync("ffmpeg", ffmpegArgs);
-      if (stdout) console.log("ffmpeg stdout:", stdout);
-      if (stderr) console.log("ffmpeg stderr:", stderr);
-    } catch (err) {
-      console.error("ffmpeg error:", err);
-      return res.status(500).json({
-        error: "ffmpeg failed",
-        details: err.stderr || err.message || String(err),
-        args: ffmpegArgs,
-      });
-    }
+    console.log("Running ffmpeg...");
+    await execFileAsync("ffmpeg", ffmpegArgs);
 
     console.log("Reading output file:", outPath);
     const mp4 = fs.readFileSync(outPath);
     res.setHeader("Content-Type", "video/mp4");
     res.send(mp4);
     console.log("Video sent to client");
+
   } catch (err) {
-    console.error("Unexpected error in /render:", err);
-    res.status(500).json({
-      error: "internal error",
-      details: err.message || String(err),
-    });
+    console.error("Unexpected error:", err);
+    res.status(500).json({ error: "internal error", details: err.message });
   } finally {
     // cleanup
     try {
       if (fs.existsSync(tmpDir)) {
-        console.log("Cleaning up temp dir:", tmpDir);
-        fs.readdirSync(tmpDir).forEach((file) => {
-          try { fs.unlinkSync(path.join(tmpDir, file)); } catch {}
-        });
-        fs.rmdirSync(tmpDir);
+        fs.rmSync(tmpDir, { recursive: true, force: true });
       }
-    } catch (cleanupErr) {
-      console.error("Error during cleanup:", cleanupErr);
-    }
-    console.log("----- /render finished -----");
+    } catch (e) { console.error("Cleanup error:", e); }
   }
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Render server listening on port ${PORT}`);
+// Critical change: listen on 0.0.0.0 for Docker/Railway
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Studio Zero Render Server listening on port ${PORT}`);
 });
